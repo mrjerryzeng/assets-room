@@ -351,16 +351,25 @@
             <form id="asset-form">
                 <div class="form-group">
                     <label id="label-name">名稱/代碼</label>
-                    <input type="text" id="input-name" required placeholder="例如：2330 或 中信銀">
+                    <input type="text" id="input-name" required placeholder="例如：2330 或 台積電" list="stock-list-options">
+                    <datalist id="stock-list-options"></datalist>
                 </div>
 
                 <div id="stock-fields" style="display: none;">
                     <div class="form-group">
-                        <label>持股數量 (股)</label>
-                        <input type="number" id="input-quantity" step="1" placeholder="0">
+                        <label>市場</label>
+                        <select id="input-market"
+                            style="width: 100%; padding: 12px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; color: white; margin-bottom: 5px;">
+                            <option value="TW">台股 (TWD)</option>
+                            <option value="US">美股 (自動換算為台幣)</option>
+                        </select>
                     </div>
                     <div class="form-group">
-                        <label>當前金價/股價 (元)</label>
+                        <label>持股數量 (股)</label>
+                        <input type="number" id="input-quantity" step="any" placeholder="0">
+                    </div>
+                    <div class="form-group">
+                        <label>當前股價 (台幣/元)</label>
                         <div style="display: flex; gap: 5px;">
                             <input type="number" id="input-price" step="0.01" placeholder="0.00">
                             <button type="button" class="btn btn-fetch" onclick="fetchPriceAction()">抓取</button>
@@ -395,6 +404,48 @@
         let currentTab = 'bank';
         let editingId = null;
         let myChart = null;
+        let twStockMap = new Map();
+        let twNameMap = new Map();
+
+        async function initTwStocks() {
+            try {
+                const res = await fetch("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo");
+                const json = await res.json();
+                if (json.data) {
+                    const datalist = document.getElementById('stock-list-options');
+                    let optionsHtml = '';
+                    const addedIds = new Set();
+
+                    json.data.forEach(item => {
+                        if (item.stock_id && item.stock_name) {
+                            twStockMap.set(item.stock_id, item.stock_name);
+                            twNameMap.set(item.stock_name, item.stock_id);
+
+                            if (!addedIds.has(item.stock_id)) {
+                                addedIds.add(item.stock_id);
+                                optionsHtml += `<option value="${item.stock_name} (${item.stock_id})"></option>`;
+                            }
+                        }
+                    });
+                    datalist.innerHTML = optionsHtml;
+
+                    let changed = false;
+                    db.stock.forEach(s => {
+                        let market = s.market || 'TW';
+                        if (market === 'TW' && !s.symbol && /^\\d+$/.test(s.name) && twStockMap.has(s.name)) {
+                            s.symbol = s.name;
+                            s.name = twStockMap.get(s.name);
+                            changed = true;
+                        }
+                    });
+                    if (changed) saveData();
+                    else renderAll();
+                }
+            } catch (e) {
+                console.log("TW stocks load failed", e);
+            }
+        }
+        initTwStocks();
 
         // --- 核心邏輯 ---
 
@@ -407,36 +458,79 @@
         // 格式化貨幣
         const fmt = (v) => '$' + Math.round(v).toLocaleString();
 
+        // 抓取匯率
+        async function getExchangeRate() {
+            if (GAS_URL) {
+                try {
+                    const res = await fetch(`${GAS_URL}?ticker=TWD%3DX`);
+                    const json = await res.json();
+                    if (json.price && json.price !== "#N/A") return json.price;
+                } catch (e) {
+                    console.log('GAS Error for exchange rate', e);
+                }
+            }
+
+            const target = `https://query1.finance.yahoo.com/v8/finance/chart/TWD=X?interval=1d&range=1d`;
+            try {
+                const res = await fetch(PROXY + encodeURIComponent(target));
+                const data = await res.json();
+                const rate = data.chart?.result?.[0]?.meta?.regularMarketPrice;
+                if (rate) return rate;
+            } catch (e) {
+                console.log('Proxy Error for exchange rate', e);
+            }
+            throw new Error('匯率抓取失敗');
+        }
+
         // 抓取股價邏輯
-        async function getStockPrice(code) {
+        async function getStockPrice(code, market = 'TW') {
             code = code.trim().toUpperCase();
 
             // 如果有 GAS，優先使用
-            if (GAS_URL) {
-                const ticker = /^\d+$/.test(code) ? `TPE:${code}` : code;
-                const res = await fetch(`${GAS_URL}?ticker=${ticker}`);
-                const json = await res.json();
-                if (json.price && json.price !== "#N/A") return json.price;
-                throw new Error('GAS 無法取得價格');
+            try {
+                if (GAS_URL) {
+                    let ticker = code;
+                    if (market === 'TW' && /^\d+$/.test(code)) ticker = `TPE:${code}`;
+
+                    const res = await fetch(`${GAS_URL}?ticker=${ticker}`);
+                    const json = await res.json();
+                    if (json.price && json.price !== "#N/A") return json.price;
+                    if (json.error) throw new Error(json.error);
+                }
+            } catch (e) {
+                console.log('GAS Error, fallback to Yahoo', e);
             }
 
             // 否則使用 Yahoo Finance + Proxy
-            const symbol = /^\d+$/.test(code) ? `${code}.TW` : code;
+            const symbol = market === 'TW' ? (/^\d+$/.test(code) ? `${code}.TW` : code) : code;
             const target = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
 
             const res = await fetch(PROXY + encodeURIComponent(target));
             const data = await res.json();
-            const price = data.chart.result[0].meta.regularMarketPrice;
+            const price = data.chart?.result?.[0]?.meta?.regularMarketPrice;
             if (price) return price;
             throw new Error('抓取失敗');
         }
 
         async function fetchPriceAction() {
-            const code = document.getElementById('input-name').value;
+            let inputVal = document.getElementById('input-name').value.trim();
+            const market = document.getElementById('input-market').value;
             const status = document.getElementById('price-status');
             const btn = document.querySelector('.btn-fetch');
 
-            if (!code) return alert('請先輸入代碼');
+            if (!inputVal) return alert('請先輸入代碼或名稱');
+
+            let code = inputVal;
+            if (market === 'TW') {
+                const match = inputVal.match(/\((\d+)\)/);
+                if (match) {
+                    code = match[1];
+                } else if (twNameMap.has(inputVal)) {
+                    code = twNameMap.get(inputVal);
+                } else if (twStockMap.has(inputVal)) {
+                    code = inputVal;
+                }
+            }
 
             btn.disabled = true;
             status.style.display = 'block';
@@ -444,9 +538,16 @@
             status.textContent = '搜尋中...';
 
             try {
-                const p = await getStockPrice(code);
-                document.getElementById('input-price').value = p;
-                status.textContent = `成功！最新報價: ${p}`;
+                let p = await getStockPrice(code, market);
+                let msg = `成功！最新報價: ${p}`;
+                if (market === 'US') {
+                    status.textContent = '取得美元對台幣匯率中...';
+                    const rate = await getExchangeRate();
+                    p = p * rate;
+                    msg = `報價(USD): ${(p / rate).toFixed(2)}，匯率: ${rate.toFixed(2)}，換算台幣: ${Math.round(p)}`;
+                }
+                document.getElementById('input-price').value = p.toFixed(2);
+                status.textContent = msg;
             } catch (e) {
                 status.textContent = '抓取失敗，請手動輸入';
                 status.className = 'price-status error';
@@ -461,9 +562,16 @@
             btn.textContent = '更新中...';
             btn.disabled = true;
 
+            let usRate = null;
+
             for (let item of db.stock) {
                 try {
-                    const newPrice = await getStockPrice(item.name);
+                    let codeToFetch = item.symbol || item.name;
+                    let newPrice = await getStockPrice(codeToFetch, item.market || 'TW');
+                    if (item.market === 'US') {
+                        if (!usRate) usRate = await getExchangeRate();
+                        newPrice = newPrice * usRate;
+                    }
                     item.price = newPrice;
                 } catch (e) { console.log(item.name + ' 更新失敗'); }
             }
@@ -503,11 +611,13 @@
                 div.className = 'asset-item';
 
                 const val = type === 'bank' ? item.amount : (item.quantity * item.price);
-                const sub = type === 'bank' ? '存款帳戶' : `${item.quantity} 股 @ ${item.price}`;
+                const marketLabel = item.market === 'US' ? '<span style="font-size: 0.7rem; background: var(--accent-blue); padding: 2px 6px; border-radius: 4px; color: white;">美股</span> ' : '';
+                const sub = type === 'bank' ? '存款帳戶' : `${marketLabel}${item.quantity} 股 @ $${Number(item.price).toFixed(2)}`;
+                const displayName = (type === 'stock' && item.market !== 'US' && item.symbol) ? `${item.name} (${item.symbol})` : item.name;
 
                 div.innerHTML = `
                 <div class="asset-info">
-                    <h4>${item.name}</h4>
+                    <h4>${displayName}</h4>
                     <p>${sub}</p>
                 </div>
                 <div style="display: flex; align-items: center; gap: 15px;">
@@ -563,20 +673,30 @@
             if (type === 'stock') {
                 document.getElementById('modal-title').textContent = id ? '編輯股票' : '新增股票持股';
                 document.getElementById('label-name').textContent = '股票代碼 (例如: 2330, AAPL)';
+                document.getElementById('input-name').placeholder = '例如：2330 或 台積電';
                 document.getElementById('stock-fields').style.display = 'block';
                 document.getElementById('bank-fields').style.display = 'none';
+                document.getElementById('input-market').value = 'TW';
             } else {
                 document.getElementById('modal-title').textContent = id ? '編輯帳戶' : '新增銀行帳戶';
                 document.getElementById('label-name').textContent = '銀行/帳戶名稱';
+                document.getElementById('input-name').placeholder = '例如：國泰、台新';
                 document.getElementById('stock-fields').style.display = 'none';
                 document.getElementById('bank-fields').style.display = 'block';
             }
 
             if (id) {
                 const item = db[type].find(i => i.id === id);
-                document.getElementById('input-name').value = item.name;
-                if (type === 'bank') document.getElementById('input-amount').value = item.amount;
-                else {
+                if (type === 'bank') {
+                    document.getElementById('input-name').value = item.name;
+                    document.getElementById('input-amount').value = item.amount;
+                } else {
+                    if (item.market) document.getElementById('input-market').value = item.market;
+                    if (item.market !== 'US' && item.symbol) {
+                        document.getElementById('input-name').value = `${item.name} (${item.symbol})`;
+                    } else {
+                        document.getElementById('input-name').value = item.name;
+                    }
                     document.getElementById('input-quantity').value = item.quantity;
                     document.getElementById('input-price').value = item.price;
                 }
@@ -603,8 +723,26 @@
             if (currentTab === 'bank') {
                 itemData.amount = Number(document.getElementById('input-amount').value) || 0;
             } else {
+                itemData.market = document.getElementById('input-market').value;
                 itemData.quantity = Number(document.getElementById('input-quantity').value) || 0;
                 itemData.price = Number(document.getElementById('input-price').value) || 0;
+
+                if (itemData.market === 'TW') {
+                    const match = itemData.name.match(/(.+?)\s*\((\d+)\)/);
+                    if (match) {
+                        itemData.name = match[1].trim();
+                        itemData.symbol = match[2];
+                    } else if (twNameMap.has(itemData.name)) {
+                        itemData.symbol = twNameMap.get(itemData.name);
+                    } else if (twStockMap.has(itemData.name)) {
+                        itemData.symbol = itemData.name;
+                        itemData.name = twStockMap.get(itemData.name);
+                    } else {
+                        itemData.symbol = itemData.name;
+                    }
+                } else {
+                    itemData.symbol = itemData.name;
+                }
             }
 
             if (editingId) {
